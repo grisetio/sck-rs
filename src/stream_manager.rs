@@ -12,19 +12,134 @@
 
 use cidre::{
     api, arc, cm, cv, define_obj_type, dispatch, ns, objc, sc,
-    sc::stream::{Output, OutputImpl},
+    sc::stream::{
+        Delegate as StreamDelegate, DelegateImpl as StreamDelegateImpl, Output, OutputImpl,
+    },
 };
 use image::RgbaImage;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::capture::{await_sck_callback, get_shareable_content, safe_image_buf_to_rgba};
 use crate::error::{XCapError, XCapResult};
+
+struct UserStopListener {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+/// A scoped listener for a user-initiated ScreenCaptureKit stop.
+///
+/// The stop is latched, so `wait` returns immediately after the first event and
+/// remains complete on subsequent calls. Dropping the subscription disables
+/// notifications to it.
+pub struct UserStopSubscription {
+    receiver: tokio::sync::watch::Receiver<bool>,
+    _listener: Arc<UserStopListener>,
+}
+
+impl UserStopSubscription {
+    /// Wait until a stream reports `SCStreamErrorUserStopped` (-3817) in
+    /// `SCStreamErrorDomain`.
+    ///
+    /// Other stream errors do not complete this wait. Once notified, subsequent
+    /// calls return immediately.
+    pub async fn wait(&mut self) {
+        while !*self.receiver.borrow() {
+            if self.receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+static USER_STOP_SUBSCRIPTIONS: Lazy<Mutex<Vec<Weak<UserStopListener>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static USER_STOP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Subscribe to future `SCStreamErrorUserStopped` (-3817) errors.
+///
+/// Each stream snapshots the current subscriptions when it is constructed, so
+/// subscribe before starting capture to receive that stream's stop event.
+pub fn subscribe_user_stop() -> UserStopSubscription {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    let listener = Arc::new(UserStopListener { sender });
+    let mut listeners = USER_STOP_SUBSCRIPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    listeners.retain(|listener| listener.strong_count() > 0);
+    listeners.push(Arc::downgrade(&listener));
+    UserStopSubscription {
+        receiver,
+        _listener: listener,
+    }
+}
+
+fn snapshot_user_stop_subscriptions() -> Vec<Weak<UserStopListener>> {
+    let mut listeners = USER_STOP_SUBSCRIPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    listeners.retain(|listener| listener.strong_count() > 0);
+    listeners.clone()
+}
+
+struct UserStopDelegateInner {
+    listeners: Vec<Weak<UserStopListener>>,
+}
+
+define_obj_type!(
+    UserStopDelegate + StreamDelegateImpl,
+    UserStopDelegateInner,
+    USER_STOP_DELEGATE_CLS
+);
+
+impl StreamDelegate for UserStopDelegate {}
+
+impl UserStopDelegate {
+    fn snapshot() -> arc::R<Self> {
+        Self::with(UserStopDelegateInner {
+            listeners: snapshot_user_stop_subscriptions(),
+        })
+    }
+
+    fn handle_stop_error(&mut self, error: &ns::Error) {
+        notify_user_stop(error, &self.inner_mut().listeners);
+    }
+}
+
+#[objc::add_methods]
+impl StreamDelegateImpl for UserStopDelegate {
+    extern "C" fn impl_stream_did_stop_with_err(
+        &mut self,
+        _cmd: Option<&objc::Sel>,
+        _stream: &sc::Stream,
+        error: &ns::Error,
+    ) {
+        self.handle_stop_error(error);
+    }
+}
+
+fn notify_user_stop(error: &ns::Error, listeners: &[Weak<UserStopListener>]) {
+    let screen_capture_domain = error.domain().eq_ns_string(sc::error::domain());
+    let code = error.code();
+    info!(
+        screen_capture_domain,
+        code, "ScreenCaptureKit stream stopped"
+    );
+
+    if screen_capture_domain && code == sc::error::code::USER_STOPPED {
+        info!(code, "ScreenCaptureKit stream stopped by user");
+        for listener in listeners.iter().filter_map(Weak::upgrade) {
+            listener.sender.send_replace(true);
+        }
+    }
+}
 
 // ── Frame receiver (ObjC callback) ─────────────────────────────────
 
@@ -195,6 +310,7 @@ static STREAM_STOP_LIMITER: StopLimiter = StopLimiter::new(MAX_PENDING_STREAM_ST
 struct MonitorStream {
     _stream: arc::R<sc::Stream>,
     _output: arc::R<FrameReceiver>,
+    _stop_delegate: arc::R<UserStopDelegate>,
     _queue: arc::R<dispatch::Queue>,
     latest_frame: Arc<Mutex<Option<RgbaImage>>>,
     frame_notify: Arc<tokio::sync::Notify>,
@@ -249,7 +365,8 @@ impl MonitorStream {
 
         let filter = build_exclusion_filter(sc_display, content, excluded_window_ids);
 
-        let stream = sc::Stream::new(&filter, &cfg);
+        let stop_delegate = UserStopDelegate::snapshot();
+        let stream = sc::Stream::with_delegate(&filter, &cfg, stop_delegate.as_ref());
 
         stream
             .add_stream_output(output.as_ref(), sc::OutputType::Screen, Some(&queue))
@@ -287,6 +404,7 @@ impl MonitorStream {
         Ok(Self {
             _stream: stream,
             _output: output,
+            _stop_delegate: stop_delegate,
             _queue: queue,
             latest_frame,
             frame_notify,
@@ -323,6 +441,7 @@ impl Drop for MonitorStream {
         let stream = self._stream.retained();
         let mut keep_stream_alive = Some(stream.retained());
         let mut keep_output_alive = Some(self._output.retained());
+        let mut keep_stop_delegate_alive = Some(self._stop_delegate.retained());
         let mut keep_queue_alive = Some(self._queue.retained());
         let mut stop_slot = Some(stop_slot);
         stream.stop_with_ch(move |error| {
@@ -336,6 +455,7 @@ impl Drop for MonitorStream {
             // so an unexpected duplicate callback remains harmless.
             let _ = keep_queue_alive.take();
             let _ = keep_output_alive.take();
+            let _ = keep_stop_delegate_alive.take();
             let _ = keep_stream_alive.take();
             let _ = stop_slot.take();
         });
@@ -773,6 +893,117 @@ pub fn start_hd_capture(
         },
         rx,
     ))
+}
+
+#[cfg(test)]
+mod user_stop_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn documented_user_stopped_error_wakes_subscriber() {
+        let _guard = USER_STOP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut subscription = subscribe_user_stop();
+        let mut delegate = UserStopDelegate::snapshot();
+        let error = ns::Error::with_domain(sc::error::domain(), -3817, None);
+
+        delegate.handle_stop_error(&error);
+
+        let wake = tokio::time::timeout(Duration::from_millis(50), subscription.wait()).await;
+        assert!(
+            wake.is_ok(),
+            "SCStreamErrorUserStopped (-3817) must wake the subscription"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), subscription.wait())
+                .await
+                .is_ok(),
+            "the user-stop notification must remain latched"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_and_foreign_errors_do_not_wake_subscriber() {
+        let _guard = USER_STOP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut subscription = subscribe_user_stop();
+        let mut delegate = UserStopDelegate::snapshot();
+        let errors = [
+            ns::Error::with_domain(sc::error::domain(), -3808, None),
+            ns::Error::with_domain(sc::error::domain(), -3821, None),
+            ns::Error::with_domain(ns::ErrorDomain::posix(), -3817, None),
+        ];
+
+        for error in &errors {
+            delegate.handle_stop_error(error);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), subscription.wait())
+                    .await
+                    .is_err(),
+                "non-user-stop NSError (domain {:?}, code {}) must not wake the subscription",
+                error.domain(),
+                error.code()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_stop_wakes_multiple_subscribers() {
+        let _guard = USER_STOP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut first = subscribe_user_stop();
+        let mut second = subscribe_user_stop();
+        let mut delegate = UserStopDelegate::snapshot();
+        let error = ns::Error::with_domain(sc::error::domain(), -3817, None);
+
+        delegate.handle_stop_error(&error);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), first.wait())
+                .await
+                .is_ok(),
+            "the first registered subscriber must wake"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second.wait())
+                .await
+                .is_ok(),
+            "the second registered subscriber must wake"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_and_late_subscribers_are_scoped_to_delegate_snapshot() {
+        let _guard = USER_STOP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let stale_subscription = subscribe_user_stop();
+        let mut old_delegate = UserStopDelegate::snapshot();
+        drop(stale_subscription);
+
+        let mut current_subscription = subscribe_user_stop();
+        let error = ns::Error::with_domain(sc::error::domain(), -3817, None);
+
+        old_delegate.handle_stop_error(&error);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), current_subscription.wait())
+                .await
+                .is_err(),
+            "an old delegate must not redirect its stop event to a later subscriber"
+        );
+
+        let mut current_delegate = UserStopDelegate::snapshot();
+        current_delegate.handle_stop_error(&error);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), current_subscription.wait())
+                .await
+                .is_ok(),
+            "a delegate created after registration must notify the current subscriber"
+        );
+    }
 }
 
 #[cfg(test)]
